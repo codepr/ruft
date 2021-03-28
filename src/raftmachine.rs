@@ -1,7 +1,8 @@
 use futures::{future, prelude::*};
 use rand::prelude::*;
+use std::boxed::Box;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::{
     io,
     net::{IpAddr, SocketAddr},
@@ -12,11 +13,13 @@ use tarpc::{
     server::{self, Channel, Incoming},
     tokio_serde::formats::Json,
 };
+use tokio::sync::Notify;
+use tokio::time::{sleep, Duration, Instant};
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 enum State {
     Follower,
-    Candiate,
+    Candidate,
     Leader,
 }
 
@@ -43,9 +46,9 @@ struct RequestVote {
 #[derive(Debug, Serialize, Deserialize)]
 struct RequestVoteReply {
     // Current term for candidate to update itself
-    term: i32,
+    pub term: i32,
     // True means candidate received vote
-    vote_granted: bool,
+    pub vote_granted: bool,
 }
 
 /// AppendEntries call, contains the current term for the candidate and the Id of the leader node
@@ -68,7 +71,7 @@ struct AppendEntriesReply {
 }
 
 #[tarpc::service]
-trait Raft {
+pub trait Raft {
     async fn request_vote(r: RequestVote) -> RequestVoteReply;
     async fn append_entries(a: AppendEntries) -> AppendEntriesReply;
 }
@@ -107,20 +110,33 @@ struct RaftMachine {
     // State of the machine, can be either CANDIDATE, FOLLOWER or LEADER
     state: State,
     // Election timer timeout
-    election_timeout: i64,
+    election_timeout: u64,
     // Last received heartbeat from leader
-    latest_heartbeat: i64,
+    latest_heartbeat: u64,
     // Cluster reference to all nodes
-    cluster: Arc<RaftCluster>,
+    cluster: Arc<Mutex<RaftCluster>>,
 }
 
 #[tarpc::server]
 impl Raft for RaftMachine {
-    async fn request_vote(self, _: context::Context, r: RequestVote) -> RequestVoteReply {
-        RequestVoteReply {
+    async fn request_vote(mut self, _: context::Context, r: RequestVote) -> RequestVoteReply {
+        let mut re = RequestVoteReply {
             term: 0,
             vote_granted: false,
+        };
+        if r.term > self.current_term {
+            self.state = State::Follower;
+            self.current_term = r.term;
+            self.voted_for = "".into();
         }
+        if self.current_term == r.term
+            && (self.voted_for.is_empty() || self.voted_for == r.candidate_id)
+        {
+            self.voted_for = r.candidate_id.clone();
+            re.vote_granted = true;
+        }
+        re.term = self.current_term;
+        return re;
     }
 
     async fn append_entries(self, _: context::Context, a: AppendEntries) -> AppendEntriesReply {
@@ -132,7 +148,7 @@ impl Raft for RaftMachine {
 }
 
 impl RaftMachine {
-    pub fn new(cluster: Arc<RaftCluster>, addr: String) -> Self {
+    pub fn new(cluster: Arc<Mutex<RaftCluster>>, addr: String) -> Self {
         Self {
             id: addr.clone(),
             current_term: 0,
@@ -146,16 +162,83 @@ impl RaftMachine {
             cluster: cluster,
         }
     }
+
+    async fn start_election_timer(&self) {
+        println!("Election");
+        let term_started = self.current_term;
+        let timeout = Duration::from_millis(self.election_timeout);
+        let now = Instant::now();
+        // Pause execution until the back off period elapses.
+        sleep(timeout).await;
+        // Skip election if already a Leader or if the term has already been changed
+        // by another RequestVoteRPC from another Candidate
+        if (self.state != State::Candidate && self.state != State::Follower)
+            || term_started != self.current_term
+        {
+            return;
+        }
+        // Start the election, random initialization of election timeout should
+        // guarantee that one node will send his RequestVoteRPC before any other
+        if now.elapsed() > Duration::from_millis(self.election_timeout) {
+            println!("Start election");
+        }
+    }
+
+    async fn start_election(&mut self) -> io::Result<()> {
+        self.state = State::Candidate;
+        self.current_term += 1;
+        self.voted_for = self.id.clone();
+        let cluster = self.cluster.lock().unwrap();
+        for client in cluster.nodes.values() {
+            let rv = RequestVote {
+                term: self.current_term,
+                candidate_id: self.id.clone(),
+                last_log_term: 0,
+                last_log_index: 0,
+            };
+            let reply = client.request_vote(context::current(), rv).await?;
+            if self.state != State::Candidate {
+                return Ok(());
+            }
+            if reply.term > self.current_term {
+                self.state = State::Follower;
+                self.current_term = reply.term;
+                self.voted_for = "".into();
+                break;
+            } else if reply.term == self.current_term {
+                if reply.vote_granted {
+                    // Check for leader quorum here
+                    self.state = State::Leader;
+                    println!("Become leader");
+                    return Ok(());
+                }
+            }
+        }
+        self.start_election_timer().await;
+        Ok(())
+    }
+
+    async fn become_follower(&mut self, term: i32) -> io::Result<()> {
+        self.state = State::Follower;
+        self.current_term = term;
+        self.voted_for = "".into();
+        println!("Become follower");
+        Ok(())
+    }
 }
 
 pub struct RaftCluster {
-    nodes: HashMap<String, RaftClient>,
+    pub nodes: HashMap<String, RaftClient>,
+    notify: Arc<Notify>,
+    connection_retries: i32,
 }
 
 impl RaftCluster {
-    pub fn new() -> Self {
+    pub fn new(notify: Arc<Notify>) -> Self {
         Self {
             nodes: HashMap::new(),
+            notify: notify,
+            connection_retries: 3,
         }
     }
 
@@ -172,13 +255,23 @@ impl RaftCluster {
 
     pub async fn start(&mut self, peers: Vec<String>) -> io::Result<()> {
         for peer in peers.iter() {
-            self.connect(peer).await?;
+            for i in 0..self.connection_retries {
+                match self.connect(peer).await {
+                    Ok(_) => break,
+                    Err(_) => println!("Re-try"),
+                }
+            }
         }
+        self.notify.notify_one();
         Ok(())
     }
 }
 
-pub async fn run(cluster: Arc<RaftCluster>, addr: &str) -> io::Result<()> {
+pub async fn run(
+    cluster: Arc<Mutex<RaftCluster>>,
+    notify: Arc<Notify>,
+    addr: &str,
+) -> io::Result<()> {
     let mut listener = tarpc::serde_transport::tcp::listen(addr, Json::default).await?;
     listener.config_mut().max_frame_length(usize::MAX);
     // let server = server::BaseChannel::with_defaults(listener);
@@ -192,8 +285,14 @@ pub async fn run(cluster: Arc<RaftCluster>, addr: &str) -> io::Result<()> {
         // the generated World trait.
         .map(|channel| {
             let c = cluster.clone();
-            let server = RaftMachine::new(c, addr.into());
-            channel.requests().execute(server.serve())
+            let server = Box::new(RaftMachine::new(c, addr.into()));
+            let notify = notify.clone();
+            let s = server.clone();
+            tokio::spawn(async move {
+                notify.notified().await;
+                server.start_election_timer().await;
+            });
+            channel.requests().execute(s.serve())
         })
         // Max 10 channels.
         .buffer_unordered(10)

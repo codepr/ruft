@@ -10,5 +10,5 @@ edition = "2018"
 futures = "0.3"
 serde = { version = "1.0" }
 tarpc = { version = "0.25", features = ["full"] }
-tokio = { version = "1.0", features = ["macros", "net", "rt-multi-thread"] }
+tokio = { version = "1.4.0", features = ["full"] }
 rand = "0.8.3"
