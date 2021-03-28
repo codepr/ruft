@@ -97,7 +97,7 @@ struct RaftMachine {
     // monotonically
     current_term: i32,
     // Candidate Id that received vote in the current term or nil if none
-    voted_for: String,
+    voted_for: Option<String>,
     // Log entries; each entry contains command for state machine, and term
     // when entry was received by leader, first index is 1
     log: Vec<LogEntry>,
@@ -127,12 +127,12 @@ impl Raft for RaftMachine {
         if r.term > self.current_term {
             self.state = State::Follower;
             self.current_term = r.term;
-            self.voted_for = "".into();
+            self.voted_for = None;
         }
         if self.current_term == r.term
-            && (self.voted_for.is_empty() || self.voted_for == r.candidate_id)
+            && (self.voted_for.is_none() || self.voted_for.unwrap() == r.candidate_id)
         {
-            self.voted_for = r.candidate_id.clone();
+            self.voted_for = Some(r.candidate_id.clone());
             re.vote_granted = true;
         }
         re.term = self.current_term;
@@ -152,7 +152,7 @@ impl RaftMachine {
         Self {
             id: addr.clone(),
             current_term: 0,
-            voted_for: "".into(),
+            voted_for: None,
             log: Vec::new(),
             commit_index: 0,
             last_applied: 0,
@@ -187,7 +187,7 @@ impl RaftMachine {
     async fn start_election(&mut self) -> io::Result<()> {
         self.state = State::Candidate;
         self.current_term += 1;
-        self.voted_for = self.id.clone();
+        self.voted_for = Some(self.id.clone());
         let cluster = self.cluster.lock().unwrap();
         for client in cluster.nodes.values() {
             let rv = RequestVote {
@@ -203,7 +203,7 @@ impl RaftMachine {
             if reply.term > self.current_term {
                 self.state = State::Follower;
                 self.current_term = reply.term;
-                self.voted_for = "".into();
+                self.voted_for = None;
                 break;
             } else if reply.term == self.current_term {
                 if reply.vote_granted {
@@ -221,7 +221,7 @@ impl RaftMachine {
     async fn become_follower(&mut self, term: i32) -> io::Result<()> {
         self.state = State::Follower;
         self.current_term = term;
-        self.voted_for = "".into();
+        self.voted_for = None;
         println!("Become follower");
         Ok(())
     }
