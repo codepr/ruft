@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::marker::PhantomData;
+use std::net::SocketAddr;
 use std::result::Result;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -267,13 +268,15 @@ impl RpcServer {
         // to a worker.
         loop {
             // Accepts a new connection, obtaining a valid socket.
-            let stream = self.accept().await?;
-            println!("New connection accepted");
-            // Create a clone reference of the filters database to be used by this connection.
+            let (stream, peer) = self.accept().await?;
+            println!("New connection from {}", peer.to_string());
+            // Create a clone reference of the shared raft state to be used by this connection.
             let machine = self.machine.clone();
             // Spawn a new task to process the connection, moving the ownership of the cloned
             // db into the async closure.
             tokio::spawn(async move {
+                // Create a binary codec for `RpcMessage` type, this way it's possible leverage
+                // the `Framed` struct of `tokio_util` crate to handle the serialization
                 let bin_codec: BinCodec<RpcMessage> = BinCodec::new();
                 let mut messages = Framed::new(stream, bin_codec);
                 while let Some(msg) = messages.next().await {
@@ -290,6 +293,7 @@ impl RpcServer {
                         }
                     }
                 }
+                println!("{} - connection closed", peer.to_string());
             });
         }
     }
@@ -301,7 +305,7 @@ impl RpcServer {
     /// After the second failure, the task waits for 2 seconds. Each subsequent
     /// failure doubles the wait time. If accepting fails on the 6th try after
     /// waiting for 64 seconds, then this function returns with an error.
-    async fn accept(&mut self) -> AsyncResult<TcpStream> {
+    async fn accept(&mut self) -> AsyncResult<(TcpStream, SocketAddr)> {
         let mut backoff = 1;
 
         // Try to accept a few times
@@ -309,7 +313,7 @@ impl RpcServer {
             // Perform the accept operation. If a socket is successfully
             // accepted, return it. Otherwise, save the error.
             match self.listener.accept().await {
-                Ok((socket, _)) => return Ok(socket),
+                Ok((socket, peer)) => return Ok((socket, peer)),
                 Err(err) => {
                     if backoff > self.backoff {
                         // Accept has failed too many times. Return the error.
@@ -354,13 +358,8 @@ async fn handle_request(machine: &SharedMachine, msg: RpcMessage) -> Option<RpcM
             println!("{} - AppendEntries received", shared.id);
             let success = shared.current_term == term;
             shared.update_latest_heartbeat();
-            if shared.current_term < term {
+            if shared.current_term < term || (success && shared.state != raft::State::Follower) {
                 shared.become_follower(term);
-            }
-            if success {
-                if shared.state != raft::State::Follower {
-                    shared.become_follower(term);
-                }
             }
             Some(RpcMessage::AppendEntriesReply(shared.current_term, success))
         }
@@ -393,7 +392,7 @@ where
         }
         let object: T = bincode::deserialize(&buf[..])?;
         let offset = bincode::serialized_size(&object)?;
-        buf.split_to(offset as usize);
+        let _ = buf.split_to(offset as usize);
         Ok(Some(object))
     }
 }
@@ -435,6 +434,7 @@ pub async fn run(id: String, listener: TcpListener, peers: Vec<String>) -> Async
             println!("Can't spawn `start_election_timer` worker: {:?}", e);
         }
     });
+    println!("Server starting at {}", listener.local_addr()?);
     let mut server = RpcServer {
         listener,
         backoff: BACKOFF,
@@ -477,10 +477,8 @@ async fn start_election_timer(
             term: machine.current_term,
             leader_id: machine.id.clone(),
         };
-        if let resign = client.lock().await.send_heartbeat(append_entries).await? {
-            if resign {
-                machine.state = raft::State::Follower;
-            }
+        if client.lock().await.send_heartbeat(append_entries).await? {
+            machine.state = raft::State::Follower;
         }
     }
 }
@@ -509,7 +507,7 @@ async fn start_election(shared: &SharedMachine, client: &Arc<Mutex<RpcClient>>) 
         if has_quorum(replies, client.lock().await.peers_number())
             && machine.state == raft::State::Candidate
         {
-            machine.state = raft::State::Leader;
+            machine.become_leader();
             println!("{} - Become leader", machine.id);
         }
     }
