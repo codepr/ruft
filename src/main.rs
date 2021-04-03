@@ -5,26 +5,18 @@ async fn main() -> ruft::AsyncResult<()> {
     tokio::spawn(async {
         let listener = TcpListener::bind("127.0.0.1:4989".to_string()).await?;
         ruft::rpc::run(
+            "Al".into(),
             listener,
-            [
-                "127.0.0.1:4989".into(),
-                "127.0.0.1:4990".into(),
-                "127.0.0.1:4991".into(),
-            ]
-            .to_vec(),
+            ["127.0.0.1:4990".into(), "127.0.0.1:4991".into()].to_vec(),
         )
         .await
     });
     tokio::spawn(async {
         let listener = TcpListener::bind("127.0.0.1:4990".to_string()).await?;
         ruft::rpc::run(
+            "Pete".into(),
             listener,
-            [
-                "127.0.0.1:4989".into(),
-                "127.0.0.1:4990".into(),
-                "127.0.0.1:4991".into(),
-            ]
-            .to_vec(),
+            ["127.0.0.1:4989".into(), "127.0.0.1:4991".into()].to_vec(),
         )
         .await
     });
@@ -32,13 +24,9 @@ async fn main() -> ruft::AsyncResult<()> {
         .await
         .unwrap();
     ruft::rpc::run(
+        "Becca".into(),
         listener,
-        [
-            "127.0.0.1:4989".into(),
-            "127.0.0.1:4990".into(),
-            "127.0.0.1:4991".into(),
-        ]
-        .to_vec(),
+        ["127.0.0.1:4989".into(), "127.0.0.1:4990".into()].to_vec(),
     )
     .await
 }
