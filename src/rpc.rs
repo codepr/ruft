@@ -1,6 +1,7 @@
 use crate::AsyncResult;
 use bytes::{BufMut, BytesMut};
 use futures::SinkExt;
+use log::{error, info};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -8,16 +9,16 @@ use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::result::Result;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use tokio_stream::StreamExt;
-use tokio_util::codec::{Decoder, Encoder, Framed, FramedWrite};
+use tokio_util::codec::{Decoder, Encoder, Framed};
 
 const BACKOFF: u64 = 128;
 
 mod raft {
+    use log::info;
     use rand::prelude::*;
     use tokio::time::Instant;
 
@@ -87,7 +88,7 @@ mod raft {
             self.state = State::Follower;
             self.current_term = term;
             self.voted_for = None;
-            println!("{} - Become follower", self.id);
+            info!("{} become follower", self.id);
         }
     }
 }
@@ -225,7 +226,7 @@ impl RpcClient {
                             }
                         }
                     }
-                    Err(e) => println!("{}", e),
+                    Err(e) => error!("{}", e),
                 }
             };
         }
@@ -269,7 +270,7 @@ impl RpcServer {
         loop {
             // Accepts a new connection, obtaining a valid socket.
             let (stream, peer) = self.accept().await?;
-            println!("New connection from {}", peer.to_string());
+            info!("connection from {}", peer.to_string());
             // Create a clone reference of the shared raft state to be used by this connection.
             let machine = self.machine.clone();
             // Spawn a new task to process the connection, moving the ownership of the cloned
@@ -284,16 +285,16 @@ impl RpcServer {
                         Ok(m) => {
                             if let Some(response) = handle_request(&machine, m).await {
                                 if let Err(e) = messages.send(response).await {
-                                    println!("error sending response: {:?}", e);
+                                    error!("error sending response: {:?}", e);
                                 }
                             }
                         }
                         Err(e) => {
-                            println!("error on deconding from stream: {:?}", e);
+                            error!("error on deconding from stream: {:?}", e);
                         }
                     }
                 }
-                println!("{} - connection closed", peer.to_string());
+                info!("{} disconnected", peer.to_string());
             });
         }
     }
@@ -335,12 +336,10 @@ async fn handle_request(machine: &SharedMachine, msg: RpcMessage) -> Option<RpcM
     let mut shared = machine.lock().await;
     match msg {
         RpcMessage::RequestVote(term, id, last_id, last_log) => {
-            println!("{} - RequestVote received", shared.id);
             let candidate_id = Some(id.clone());
             if term > shared.current_term {
                 shared.become_follower(term);
             }
-            println!("{} - Term received {} voted_for {}", shared.id, term, id);
             let vote_granted = if shared.current_term == term
                 && (shared.voted_for.is_none() || shared.voted_for == candidate_id)
             {
@@ -355,7 +354,6 @@ async fn handle_request(machine: &SharedMachine, msg: RpcMessage) -> Option<RpcM
             ))
         }
         RpcMessage::AppendEntries(term, id) => {
-            println!("{} - AppendEntries received", shared.id);
             let success = shared.current_term == term;
             shared.update_latest_heartbeat();
             if shared.current_term < term || (success && shared.state != raft::State::Follower) {
@@ -431,10 +429,10 @@ pub async fn run(id: String, listener: TcpListener, peers: Vec<String>) -> Async
     let cloned_machine = shared.clone();
     tokio::spawn(async move {
         if let Err(e) = start_election_timer(&cloned_machine, &Arc::new(Mutex::new(client))).await {
-            println!("Can't spawn `start_election_timer` worker: {:?}", e);
+            error!("can't spawn `start_election_timer` worker: {:?}", e);
         }
     });
-    println!("Server starting at {}", listener.local_addr()?);
+    info!("listening on {}", listener.local_addr()?);
     let mut server = RpcServer {
         listener,
         backoff: BACKOFF,
@@ -477,6 +475,7 @@ async fn start_election_timer(
             term: machine.current_term,
             leader_id: machine.id.clone(),
         };
+        info!("{} sending heartbeats", machine.id);
         if client.lock().await.send_heartbeat(append_entries).await? {
             machine.state = raft::State::Follower;
         }
@@ -486,7 +485,10 @@ async fn start_election_timer(
 async fn start_election(shared: &SharedMachine, client: &Arc<Mutex<RpcClient>>) -> AsyncResult<()> {
     let rv = {
         let mut machine = shared.lock().await;
-        println!("{} - Starting election", machine.id);
+        info!(
+            "{} started election on term {}",
+            machine.id, machine.current_term
+        );
         machine.state = raft::State::Candidate;
         machine.current_term += 1;
         machine.voted_for = Some(machine.id.clone());
@@ -507,8 +509,15 @@ async fn start_election(shared: &SharedMachine, client: &Arc<Mutex<RpcClient>>) 
         if has_quorum(replies, client.lock().await.peers_number())
             && machine.state == raft::State::Candidate
         {
+            info!(
+                "{} has won the election on term {}",
+                machine.id, machine.current_term,
+            );
             machine.become_leader();
-            println!("{} - Become leader", machine.id);
+            info!(
+                "{} become leader on term {}",
+                machine.id, machine.current_term
+            );
         }
     }
     Ok(())
