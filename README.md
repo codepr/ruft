@@ -1,7 +1,8 @@
 Raft
 ====
 
-Basic implementation of a Raft distributed consensus algorithm, using `tokio`.
+Basic implementation of a Raft distributed consensus algorithm, using `tokio` based on raft paper
+[https://raft.github.io/raft.pdf](https://raft.github.io/raft.pdf).
 Proof-of-concept made to learn, proceeding step by step starting with simple
 abstractions over the concepts.
 Referring to
