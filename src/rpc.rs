@@ -183,7 +183,9 @@ impl RpcClient {
             peers: HashMap::new(),
         };
         for peer in peers.iter() {
-            executor::block_on(client.connect(peer));
+            if let Err(e) = executor::block_on(client.connect(peer)) {
+                error!("connection to {} failed: {:?}", peer, e);
+            }
         }
         client
     }
@@ -374,6 +376,10 @@ async fn handle_request(machine: &SharedMachine, msg: RpcMessage) -> Option<RpcM
             ))
         }
         RpcMessage::AppendEntries(term, id) => {
+            info!(
+                "{} received AppendEntries(term={} id={})",
+                shared.id, term, id
+            );
             let success = shared.current_term == term;
             shared.update_latest_heartbeat();
             if shared.current_term < term || (success && shared.state != raft::State::Follower) {
@@ -442,14 +448,14 @@ impl<T> fmt::Debug for BinCodec<T> {
 /// Requires single, already bound `TcpListener` argument
 pub async fn run(id: String, listener: TcpListener, peers: Vec<String>) -> AsyncResult<()> {
     let client = RpcClient::new(&peers);
-    let shared = Arc::new(Mutex::new(raft::Machine::new(id)));
+    let shared = Arc::new(Mutex::new(raft::Machine::new(id.clone())));
     let cloned_machine = shared.clone();
     tokio::spawn(async move {
         if let Err(e) = start_election_timer(&cloned_machine, &Arc::new(Mutex::new(client))).await {
             error!("can't spawn `start_election_timer` worker: {:?}", e);
         }
     });
-    info!("listening on {}", listener.local_addr()?);
+    info!("{} listening on {}", id, listener.local_addr()?);
     let mut server = RpcServer {
         listener,
         backoff: BACKOFF,
@@ -482,6 +488,9 @@ async fn start_election_timer(
     if new_election {
         start_election(&shared.clone(), &client.clone()).await?;
     }
+    // Start sending heartbeats to all connected nodes in the cluster only if the election is
+    // won. Each `send_heartbeat` call also check for machine state, must be set to
+    // `raft::State::Leader`.
     loop {
         sleep(Duration::from_millis(50)).await;
         let mut machine = shared.lock().await;
@@ -493,10 +502,14 @@ async fn start_election_timer(
             leader_id: machine.id.clone(),
         };
         info!("{} sending heartbeats", machine.id);
-        let (term, resign) = client.lock().await.send_heartbeat(append_entries).await?;
-        if resign {
-            machine.become_follower(term);
-        }
+        match client.lock().await.send_heartbeat(append_entries).await {
+            Ok((term, resign)) => {
+                if resign {
+                    machine.become_follower(term);
+                }
+            }
+            Err(e) => error!("failed to send heartbeats: {:?}", e),
+        };
     }
 }
 
