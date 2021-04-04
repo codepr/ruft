@@ -1,4 +1,5 @@
 use crate::AsyncResult;
+use async_trait::async_trait;
 use bytes::{BufMut, BytesMut};
 use futures::{executor, SinkExt};
 use log::{error, info};
@@ -162,6 +163,14 @@ struct RpcServer {
     /// Tcp exponential backoff threshold
     backoff: u64,
     machine: SharedMachine,
+}
+
+#[async_trait]
+trait RaftRpc {
+    async fn request_vote(r: RequestVote) -> AsyncResult<RequestVoteReply>;
+    async fn append_entries(r: AppendEntries) -> AsyncResult<AppendEntriesReply>;
+    async fn request_vote_reply(peer_id: &str, r: RequestVoteReply) -> AsyncResult<()>;
+    async fn append_entries_reply(peer_id: &str, r: AppendEntriesReply) -> AsyncResult<()>;
 }
 
 pub struct RpcClient {
