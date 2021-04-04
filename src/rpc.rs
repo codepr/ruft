@@ -213,7 +213,7 @@ impl RpcClient {
         Ok(response)
     }
 
-    pub async fn send_heartbeat(&mut self, r: AppendEntries) -> AsyncResult<bool> {
+    pub async fn send_heartbeat(&mut self, r: AppendEntries) -> AsyncResult<(i32, bool)> {
         for stream in self.peers.values_mut() {
             let append_entries = RpcMessage::AppendEntries(r.term, r.leader_id.clone());
             stream.send(append_entries).await?;
@@ -222,7 +222,7 @@ impl RpcClient {
                     Ok(re) => {
                         if let RpcMessage::AppendEntriesReply(term, success) = re {
                             if term > r.term {
-                                return Ok(true);
+                                return Ok((term, true));
                             }
                         }
                     }
@@ -230,7 +230,7 @@ impl RpcClient {
                 }
             };
         }
-        Ok(false)
+        Ok((r.term, false))
     }
 
     pub async fn request_vote_reply(&mut self, peer: &str, r: RequestVoteReply) -> AsyncResult<()> {
@@ -476,8 +476,9 @@ async fn start_election_timer(
             leader_id: machine.id.clone(),
         };
         info!("{} sending heartbeats", machine.id);
-        if client.lock().await.send_heartbeat(append_entries).await? {
-            machine.state = raft::State::Follower;
+        let (term, resign) = client.lock().await.send_heartbeat(append_entries).await?;
+        if resign {
+            machine.become_follower(term);
         }
     }
 }
