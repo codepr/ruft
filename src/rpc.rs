@@ -1,6 +1,6 @@
 use crate::AsyncResult;
 use bytes::{BufMut, BytesMut};
-use futures::SinkExt;
+use futures::{executor, SinkExt};
 use log::{error, info};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -12,6 +12,8 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
+use tokio_retry::strategy::{jitter, ExponentialBackoff};
+use tokio_retry::Retry;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
@@ -167,10 +169,14 @@ pub struct RpcClient {
 }
 
 impl RpcClient {
-    pub fn new() -> Self {
-        Self {
+    pub fn new(peers: &Vec<String>) -> Self {
+        let mut client = Self {
             peers: HashMap::new(),
+        };
+        for peer in peers.iter() {
+            executor::block_on(client.connect(peer));
         }
+        client
     }
 
     pub fn peers_number(&self) -> usize {
@@ -178,7 +184,12 @@ impl RpcClient {
     }
 
     pub async fn connect(&mut self, addr: &String) -> AsyncResult<()> {
-        let stream = TcpStream::connect(addr.clone()).await?;
+        let retry_strategy = ExponentialBackoff::from_millis(10)
+            .map(jitter) // add jitter to delays
+            .take(3); // limit to 3 retries
+        let do_connect = || TcpStream::connect(addr.clone());
+        let stream = Retry::spawn(retry_strategy, do_connect).await?;
+        // let stream = TcpStream::connect(addr.clone()).await?;
         let bin_codec: BinCodec<RpcMessage> = BinCodec::new();
         let framed_stream = Framed::new(stream, bin_codec);
         self.peers.insert(addr.clone(), framed_stream);
@@ -421,10 +432,7 @@ impl<T> fmt::Debug for BinCodec<T> {
 ///
 /// Requires single, already bound `TcpListener` argument
 pub async fn run(id: String, listener: TcpListener, peers: Vec<String>) -> AsyncResult<()> {
-    let mut client = RpcClient::new();
-    for peer in peers.iter() {
-        client.connect(peer).await?;
-    }
+    let client = RpcClient::new(&peers);
     let shared = Arc::new(Mutex::new(raft::Machine::new(id)));
     let cloned_machine = shared.clone();
     tokio::spawn(async move {
