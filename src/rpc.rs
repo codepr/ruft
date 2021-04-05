@@ -117,9 +117,13 @@ mod raft {
                 commit_index: 0,
                 last_applied: 0,
                 state: State::Follower,
-                election_timeout: rand::thread_rng().gen_range(150..300),
+                election_timeout: rand::thread_rng().gen_range(150..500),
                 latest_heartbeat: Instant::now(),
             }
+        }
+
+        pub fn election_timeout(&self) -> u64 {
+            self.election_timeout
         }
 
         pub fn update_latest_heartbeat(&mut self) {
@@ -167,6 +171,7 @@ pub enum RpcMessage {
 }
 
 struct RpcServer {
+    id: String,
     listener: TcpListener,
     /// Tcp exponential backoff threshold
     backoff: u64,
@@ -329,6 +334,57 @@ impl RaftRpc for RpcClient {
     }
 }
 
+struct BinCodec<T> {
+    phantom_data: PhantomData<T>,
+}
+
+impl<T> BinCodec<T> {
+    pub fn new() -> Self {
+        BinCodec {
+            phantom_data: PhantomData,
+        }
+    }
+}
+
+impl<T> Decoder for BinCodec<T>
+where
+    for<'de> T: Deserialize<'de> + Serialize,
+{
+    type Item = T;
+    type Error = bincode::Error;
+
+    fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if buf.len() == 0 {
+            return Ok(None);
+        }
+        let object: T = bincode::deserialize(&buf[..])?;
+        let offset = bincode::serialized_size(&object)?;
+        let _ = buf.split_to(offset as usize);
+        Ok(Some(object))
+    }
+}
+
+impl<T> Encoder<T> for BinCodec<T>
+where
+    T: Serialize,
+{
+    type Error = bincode::Error;
+
+    fn encode(&mut self, object: T, buf: &mut BytesMut) -> Result<(), Self::Error> {
+        let size = bincode::serialized_size(&object)?;
+        buf.reserve(size as usize);
+        let bytes = bincode::serialize(&object)?;
+        buf.put_slice(&bytes[..]);
+        Ok(())
+    }
+}
+
+impl<T> fmt::Debug for BinCodec<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("BinCodec").finish()
+    }
+}
+
 impl RpcServer {
     /// Create a new Server and run.
     ///
@@ -344,6 +400,12 @@ impl RpcServer {
     pub async fn run<'a>(&mut self) -> AsyncResult<()> {
         // Loop forever on new connections, accept them and pass the handling
         // to a worker.
+        info!(
+            "{} listening on {}, will start an election in {}ms",
+            self.id,
+            self.listener.local_addr()?,
+            self.machine.lock().await.election_timeout()
+        );
         loop {
             // Accepts a new connection, obtaining a valid socket.
             let (stream, peer) = self.accept().await?;
@@ -446,57 +508,6 @@ async fn handle_request(machine: &SharedMachine, msg: RpcMessage) -> Option<RpcM
     }
 }
 
-struct BinCodec<T> {
-    phantom_data: PhantomData<T>,
-}
-
-impl<T> BinCodec<T> {
-    pub fn new() -> Self {
-        BinCodec {
-            phantom_data: PhantomData,
-        }
-    }
-}
-
-impl<T> Decoder for BinCodec<T>
-where
-    for<'de> T: Deserialize<'de> + Serialize,
-{
-    type Item = T;
-    type Error = bincode::Error;
-
-    fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if buf.len() == 0 {
-            return Ok(None);
-        }
-        let object: T = bincode::deserialize(&buf[..])?;
-        let offset = bincode::serialized_size(&object)?;
-        let _ = buf.split_to(offset as usize);
-        Ok(Some(object))
-    }
-}
-
-impl<T> Encoder<T> for BinCodec<T>
-where
-    T: Serialize,
-{
-    type Error = bincode::Error;
-
-    fn encode(&mut self, object: T, buf: &mut BytesMut) -> Result<(), Self::Error> {
-        let size = bincode::serialized_size(&object)?;
-        buf.reserve(size as usize);
-        let bytes = bincode::serialize(&object)?;
-        buf.put_slice(&bytes[..]);
-        Ok(())
-    }
-}
-
-impl<T> fmt::Debug for BinCodec<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("BinCodec").finish()
-    }
-}
-
 /// Run a tokio async server, init the shared filters database and accepts and handle new
 /// connections asynchronously.
 ///
@@ -511,8 +522,8 @@ pub async fn run(id: String, listener: TcpListener, peers: Vec<String>) -> Async
             error!("can't spawn `start_election_timer` worker: {:?}", e);
         }
     });
-    info!("{} listening on {}", id, listener.local_addr()?);
     let mut server = RpcServer {
+        id: id,
         listener,
         backoff: BACKOFF,
         machine: shared,
