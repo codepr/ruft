@@ -140,6 +140,17 @@ mod raft {
             self.voted_for = None;
             info!("{} become follower", self.id);
         }
+
+        pub fn append_log_entry(&mut self, command: String) -> bool {
+            if self.state != State::Leader {
+                return false;
+            }
+            self.log.push(LogEntry {
+                term: self.current_term,
+                command,
+            });
+            true
+        }
     }
 }
 
@@ -170,7 +181,7 @@ enum RpcMessage {
     AppendEntriesReply(i32, bool),
 }
 
-struct RpcServer {
+struct TokioRpcServer {
     id: String,
     listener: TcpListener,
     /// Tcp exponential backoff threshold
@@ -202,11 +213,11 @@ trait RaftRpc {
     async fn heartbeats(&mut self, r: raft::AppendEntries) -> AsyncResult<(i32, bool)>;
 }
 
-struct RpcClient {
+struct TokioRpcClient {
     peers: HashMap<String, Framed<TcpStream, BinCodec<RpcMessage>>>,
 }
 
-impl RpcClient {
+impl TokioRpcClient {
     pub fn new(peers: &Vec<String>) -> Self {
         let mut client = Self {
             peers: HashMap::new(),
@@ -229,7 +240,6 @@ impl RpcClient {
             .take(3); // limit to 3 retries
         let do_connect = || TcpStream::connect(addr.clone());
         let stream = Retry::spawn(retry_strategy, do_connect).await?;
-        // let stream = TcpStream::connect(addr.clone()).await?;
         let bin_codec: BinCodec<RpcMessage> = BinCodec::new();
         let framed_stream = Framed::new(stream, bin_codec);
         self.peers.insert(addr.clone(), framed_stream);
@@ -238,7 +248,7 @@ impl RpcClient {
 }
 
 #[async_trait]
-impl RaftRpc for RpcClient {
+impl RaftRpc for TokioRpcClient {
     async fn request_vote(
         &mut self,
         r: raft::RequestVote,
@@ -385,7 +395,7 @@ impl<T> fmt::Debug for BinCodec<T> {
     }
 }
 
-impl RpcServer {
+impl TokioRpcServer {
     /// Create a new Server and run.
     ///
     /// Listen for inbound connections. For each inbound connection, spawn a
@@ -418,12 +428,12 @@ impl RpcServer {
                 // Create a binary codec for `RpcMessage` type, this way it's possible leverage
                 // the `Framed` struct of `tokio_util` crate to handle the serialization
                 let bin_codec: BinCodec<RpcMessage> = BinCodec::new();
-                let mut messages = Framed::new(stream, bin_codec);
-                while let Some(msg) = messages.next().await {
+                let mut frames = Framed::new(stream, bin_codec);
+                while let Some(msg) = frames.next().await {
                     match msg {
                         Ok(m) => {
                             if let Some(response) = handle_request(&machine, m).await {
-                                if let Err(e) = messages.send(response).await {
+                                if let Err(e) = frames.send(response).await {
                                     error!("error sending response: {:?}", e);
                                 }
                             }
@@ -508,21 +518,24 @@ async fn handle_request(machine: &SharedMachine, msg: RpcMessage) -> Option<RpcM
     }
 }
 
-/// Run a tokio async server, init the shared filters database and accepts and handle new
-/// connections asynchronously.
+/// Run a tokio async server, init the shared raft state and accepts and handle new
+/// connections asynchronously on the Rpc server.
 ///
-/// Requires single, already bound `TcpListener` argument
+/// Requires an `id` as identifier of the current node, an already bound `TcpListener`, and a
+/// vector of peers, represented by ip address.
 pub async fn run(id: String, listener: TcpListener, peers: Vec<String>) -> AsyncResult<()> {
     let peers_number = peers.len();
-    let client = RpcClient::new(&peers);
+    let client = TokioRpcClient::new(&peers);
     let shared = Arc::new(Mutex::new(raft::Machine::new(id.clone())));
+    // Spawn a worker to start a new election timer on the node, responsible for shared state
+    // changes and requiring an Rpc client for interactions
     let cloned_machine = shared.clone();
     tokio::spawn(async move {
         if let Err(e) = start_election_timer(&cloned_machine, client, peers_number).await {
             error!("can't spawn `start_election_timer` worker: {:?}", e);
         }
     });
-    let mut server = RpcServer {
+    let mut server = TokioRpcServer {
         id: id,
         listener,
         backoff: BACKOFF,
@@ -536,31 +549,43 @@ async fn start_election_timer(
     mut client: impl RaftRpc,
     peers_number: usize,
 ) -> AsyncResult<()> {
-    let new_election = {
-        let machine = shared.lock().await;
-        let term_started = machine.current_term;
-        let election_timeout = machine.election_timeout;
-        let timeout = Duration::from_millis(election_timeout);
-        // Pause execution until the back off period elapses.
-        sleep(timeout).await;
-        // Skip election if already a Leader or if the term has already been changed
-        // by another RequestVoteRPC from another Candidate
-        if machine.state == raft::State::Leader || term_started != machine.current_term {
-            return Ok(());
-        }
-
-        // Start the election, random initialization of election timeout should
-        // guarantee that one node will send his RequestVoteRPC before any other
-        machine.latest_heartbeat.elapsed() > Duration::from_millis(election_timeout)
-    };
-    if new_election {
-        start_election(&shared.clone(), &mut client, peers_number).await?;
-    }
-    // Start sending heartbeats to all connected nodes in the cluster only if the election is
-    // won. Each `send_heartbeat` call also check for machine state, must be set to
-    // `raft::State::Leader`.
+    // Start looping trying a new election if not already a Leader and if the latest AppendEntries
+    // received is older than the election timeout, meaning that the current leader node is dead
     loop {
-        sleep(Duration::from_millis(50)).await;
+        let new_election = {
+            if shared.lock().await.state == raft::State::Leader {
+                false
+            } else {
+                let election_timeout = shared.lock().await.election_timeout;
+                sleep(Duration::from_millis(election_timeout)).await;
+                // We open a nested scope as we don't want to keep the lock for the sleep duration
+                // allowing any other possible state change to be applied meanwhile
+                {
+                    let machine = shared.lock().await;
+                    let term_started = machine.current_term;
+                    // Skip election if already a Leader or if the term has already been changed
+                    // by another RequestVoteRPC from another Candidate, otherwise, check if the
+                    // latest interaction is older than the election timeout, meaning that the
+                    // current leader node is dead.
+                    //
+                    // We want to return false if machine is already a Leader or the term has
+                    // changed, otherwise we return the check of the elapsed timeout
+                    !(machine.state == raft::State::Leader || term_started != machine.current_term)
+                        && machine.latest_heartbeat.elapsed()
+                            > Duration::from_millis(election_timeout)
+                }
+            }
+        };
+        if new_election {
+            // we want to skip sending heartbeats if we're not the leader, which means we've not
+            // won the election
+            if !start_election(&shared.clone(), &mut client, peers_number).await? {
+                continue;
+            }
+        };
+        // Send heartbeats to all connected nodes in the cluster only if the election is
+        // won. Each `send_heartbeat` call also check for machine state, must be set to
+        // `raft::State::Leader`.
         let mut machine = shared.lock().await;
         if machine.state != raft::State::Leader {
             continue;
@@ -578,6 +603,7 @@ async fn start_election_timer(
             }
             Err(e) => error!("failed to send heartbeats: {:?}", e),
         };
+        sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -585,7 +611,7 @@ async fn start_election(
     shared: &SharedMachine,
     client: &mut impl RaftRpc,
     peers_number: usize,
-) -> AsyncResult<()> {
+) -> AsyncResult<bool> {
     let rv = {
         let mut machine = shared.lock().await;
         info!(
@@ -603,10 +629,13 @@ async fn start_election(
         }
     };
     let replies = client.request_vote(rv).await?;
+    // Again we declare a new scope to reduce contention on the shared state
     {
         let mut machine = shared.lock().await;
+        // Here it could already be a follower, in that case we want to exit and checking for
+        // new elections if needed
         if machine.state != raft::State::Candidate {
-            return Ok(());
+            return Ok(false);
         }
 
         if has_quorum(replies, peers_number) && machine.state == raft::State::Candidate {
@@ -619,9 +648,10 @@ async fn start_election(
                 "{} become leader on term {}",
                 machine.id, machine.current_term
             );
+            return Ok(true);
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 fn has_quorum(response: Vec<raft::RequestVoteReply>, peers_number: usize) -> bool {
