@@ -163,7 +163,7 @@ impl std::error::Error for RpcError {
 }
 
 #[derive(Deserialize, Serialize)]
-pub enum RpcMessage {
+enum RpcMessage {
     RequestVote(i32, String, i32, i32),
     RequestVoteReply(i32, bool),
     AppendEntries(i32, String),
@@ -202,7 +202,7 @@ trait RaftRpc {
     async fn heartbeats(&mut self, r: raft::AppendEntries) -> AsyncResult<(i32, bool)>;
 }
 
-pub struct RpcClient {
+struct RpcClient {
     peers: HashMap<String, Framed<TcpStream, BinCodec<RpcMessage>>>,
 }
 
