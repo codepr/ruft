@@ -96,6 +96,8 @@ mod raft {
     }
 }
 
+/// Carries the state of the node as described in the Raft paper, consisted of persistent state,
+/// volatile state and log entries
 type SharedMachine = Arc<Mutex<raft::Machine>>;
 
 #[derive(Debug)]
@@ -104,6 +106,12 @@ struct RpcError(String);
 impl fmt::Display for RpcError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "RPC error: {}", self.0)
+    }
+}
+
+impl std::error::Error for RpcError {
+    fn description(&self) -> &str {
+        &self.0
     }
 }
 
@@ -167,10 +175,19 @@ struct RpcServer {
 
 #[async_trait]
 trait RaftRpc {
-    async fn request_vote(r: RequestVote) -> AsyncResult<RequestVoteReply>;
-    async fn append_entries(r: AppendEntries) -> AsyncResult<AppendEntriesReply>;
-    async fn request_vote_reply(peer_id: &str, r: RequestVoteReply) -> AsyncResult<()>;
-    async fn append_entries_reply(peer_id: &str, r: AppendEntriesReply) -> AsyncResult<()>;
+    async fn request_vote(&mut self, r: RequestVote) -> AsyncResult<Vec<RequestVoteReply>>;
+    async fn append_entries(
+        &mut self,
+        peer_id: &str,
+        r: AppendEntries,
+    ) -> AsyncResult<AppendEntriesReply>;
+    async fn request_vote_reply(&mut self, peer_id: &str, r: RequestVoteReply) -> AsyncResult<()>;
+    async fn append_entries_reply(
+        &mut self,
+        peer_id: &str,
+        r: AppendEntriesReply,
+    ) -> AsyncResult<()>;
+    async fn heartbeats(&mut self, r: AppendEntries) -> AsyncResult<(i32, bool)>;
 }
 
 pub struct RpcClient {
@@ -206,8 +223,11 @@ impl RpcClient {
         self.peers.insert(addr.clone(), framed_stream);
         Ok(())
     }
+}
 
-    pub async fn request_vote(&mut self, r: RequestVote) -> AsyncResult<Vec<RequestVoteReply>> {
+#[async_trait]
+impl RaftRpc for RpcClient {
+    async fn request_vote(&mut self, r: RequestVote) -> AsyncResult<Vec<RequestVoteReply>> {
         let mut responses: Vec<RpcMessage> = Vec::new();
 
         for stream in self.peers.values_mut() {
@@ -226,16 +246,55 @@ impl RpcClient {
         let mut response = Vec::new();
         for resp in responses {
             if let RpcMessage::RequestVoteReply(term, vote_granted) = resp {
-                response.push(RequestVoteReply {
-                    term: term,
-                    vote_granted: vote_granted,
-                });
+                response.push(RequestVoteReply { term, vote_granted });
             }
         }
         Ok(response)
     }
 
-    pub async fn send_heartbeat(&mut self, r: AppendEntries) -> AsyncResult<(i32, bool)> {
+    async fn append_entries(
+        &mut self,
+        peer_id: &str,
+        r: AppendEntries,
+    ) -> AsyncResult<AppendEntriesReply> {
+        let stream = self.peers.get_mut(peer_id).unwrap();
+        let append_entries = RpcMessage::AppendEntries(r.term, r.leader_id.clone());
+        stream.send(append_entries).await?;
+        if let Some(reply) = stream.next().await {
+            match reply {
+                Ok(re) => {
+                    if let RpcMessage::AppendEntriesReply(term, success) = re {
+                        Ok(AppendEntriesReply { term, success })
+                    } else {
+                        Err(Box::new(RpcError("append_entries failed".into())))
+                    }
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            Err(Box::new(RpcError("append_entries failed".into())))
+        }
+    }
+
+    async fn request_vote_reply(&mut self, peer_id: &str, r: RequestVoteReply) -> AsyncResult<()> {
+        let stream = self.peers.get_mut(peer_id).unwrap();
+        let rvp = RpcMessage::RequestVoteReply(r.term, r.vote_granted);
+        stream.send(rvp).await?;
+        Ok(())
+    }
+
+    async fn append_entries_reply(
+        &mut self,
+        peer_id: &str,
+        r: AppendEntriesReply,
+    ) -> AsyncResult<()> {
+        let stream = self.peers.get_mut(peer_id).unwrap();
+        let reply = RpcMessage::AppendEntriesReply(r.term, r.success);
+        stream.send(reply).await?;
+        Ok(())
+    }
+
+    async fn heartbeats(&mut self, r: AppendEntries) -> AsyncResult<(i32, bool)> {
         for stream in self.peers.values_mut() {
             let append_entries = RpcMessage::AppendEntries(r.term, r.leader_id.clone());
             stream.send(append_entries).await?;
@@ -253,24 +312,6 @@ impl RpcClient {
             };
         }
         Ok((r.term, false))
-    }
-
-    pub async fn request_vote_reply(&mut self, peer: &str, r: RequestVoteReply) -> AsyncResult<()> {
-        let stream = self.peers.get_mut(peer).unwrap();
-        let rvp = RpcMessage::RequestVoteReply(r.term, r.vote_granted);
-        stream.send(rvp).await?;
-        Ok(())
-    }
-
-    pub async fn append_entries_reply(
-        &mut self,
-        peer: &str,
-        r: AppendEntriesReply,
-    ) -> AsyncResult<()> {
-        let stream = self.peers.get_mut(peer).unwrap();
-        let reply = RpcMessage::AppendEntriesReply(r.term, r.success);
-        stream.send(reply).await?;
-        Ok(())
     }
 }
 
@@ -447,11 +488,12 @@ impl<T> fmt::Debug for BinCodec<T> {
 ///
 /// Requires single, already bound `TcpListener` argument
 pub async fn run(id: String, listener: TcpListener, peers: Vec<String>) -> AsyncResult<()> {
+    let peers_number = peers.len();
     let client = RpcClient::new(&peers);
     let shared = Arc::new(Mutex::new(raft::Machine::new(id.clone())));
     let cloned_machine = shared.clone();
     tokio::spawn(async move {
-        if let Err(e) = start_election_timer(&cloned_machine, &Arc::new(Mutex::new(client))).await {
+        if let Err(e) = start_election_timer(&cloned_machine, client, peers_number).await {
             error!("can't spawn `start_election_timer` worker: {:?}", e);
         }
     });
@@ -466,7 +508,8 @@ pub async fn run(id: String, listener: TcpListener, peers: Vec<String>) -> Async
 
 async fn start_election_timer(
     shared: &SharedMachine,
-    client: &Arc<Mutex<RpcClient>>,
+    mut client: impl RaftRpc,
+    peers_number: usize,
 ) -> AsyncResult<()> {
     let new_election = {
         let machine = shared.lock().await;
@@ -486,7 +529,7 @@ async fn start_election_timer(
         machine.latest_heartbeat.elapsed() > Duration::from_millis(election_timeout)
     };
     if new_election {
-        start_election(&shared.clone(), &client.clone()).await?;
+        start_election(&shared.clone(), &mut client, peers_number).await?;
     }
     // Start sending heartbeats to all connected nodes in the cluster only if the election is
     // won. Each `send_heartbeat` call also check for machine state, must be set to
@@ -502,7 +545,7 @@ async fn start_election_timer(
             leader_id: machine.id.clone(),
         };
         info!("{} sending heartbeats", machine.id);
-        match client.lock().await.send_heartbeat(append_entries).await {
+        match client.heartbeats(append_entries).await {
             Ok((term, resign)) => {
                 if resign {
                     machine.become_follower(term);
@@ -513,7 +556,11 @@ async fn start_election_timer(
     }
 }
 
-async fn start_election(shared: &SharedMachine, client: &Arc<Mutex<RpcClient>>) -> AsyncResult<()> {
+async fn start_election(
+    shared: &SharedMachine,
+    client: &mut impl RaftRpc,
+    peers_number: usize,
+) -> AsyncResult<()> {
     let rv = {
         let mut machine = shared.lock().await;
         info!(
@@ -530,16 +577,14 @@ async fn start_election(shared: &SharedMachine, client: &Arc<Mutex<RpcClient>>) 
             last_log_index: 0,
         }
     };
-    let replies = client.lock().await.request_vote(rv).await?;
+    let replies = client.request_vote(rv).await?;
     {
         let mut machine = shared.lock().await;
         if machine.state != raft::State::Candidate {
             return Ok(());
         }
 
-        if has_quorum(replies, client.lock().await.peers_number())
-            && machine.state == raft::State::Candidate
-        {
+        if has_quorum(replies, peers_number) && machine.state == raft::State::Candidate {
             info!(
                 "{} has won the election on term {}",
                 machine.id, machine.current_term,
