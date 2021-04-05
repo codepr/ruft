@@ -1,4 +1,4 @@
-Raft
+(Ru)st ra(ft)
 ====
 
 Basic implementation of a Raft distributed consensus algorithm, using `tokio` based on raft paper
