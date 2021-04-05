@@ -39,6 +39,49 @@ mod raft {
         command: String,
     }
 
+    /// RequestVote call as described in Raft paper, it carries:
+    ///
+    /// - the candidate's term
+    /// - the candidate's id
+    /// - the index of the candidate's last log entry
+    /// - the term of the candidate's last log entry
+    pub struct RequestVote {
+        // Candidate's term
+        pub term: i32,
+        // Candidate's identifier
+        pub candidate_id: String,
+        // Index of the candidate's last log entry
+        pub last_log_index: i32,
+        // Term of the candidate's last log entry
+        pub last_log_term: i32,
+    }
+
+    /// RequestVoteReply contains the current term for candidate to update, and a bool indication of
+    /// received vote
+    pub struct RequestVoteReply {
+        // Current term for candidate to update itself
+        pub term: i32,
+        // True means candidate received vote
+        pub vote_granted: bool,
+    }
+
+    /// AppendEntries call, contains the current term for the candidate and the Id of the leader node
+    pub struct AppendEntries {
+        // Current term of the requesting node
+        pub term: i32,
+        // Leader ID
+        pub leader_id: String,
+    }
+
+    /// AppendEntriesReply call, contains the current term for candidate and a bool indication of
+    /// received vote
+    pub struct AppendEntriesReply {
+        // Current term for candidate to update itself
+        pub term: i32,
+        // True means candidate received vote
+        pub success: bool,
+    }
+
     pub struct Machine {
         // Identifier of the current node on the cluster
         pub id: String,
@@ -115,49 +158,6 @@ impl std::error::Error for RpcError {
     }
 }
 
-/// RequestVote call as described in Raft paper, it carries:
-///
-/// - the candidate's term
-/// - the candidate's id
-/// - the index of the candidate's last log entry
-/// - the term of the candidate's last log entry
-pub struct RequestVote {
-    // Candidate's term
-    pub term: i32,
-    // Candidate's identifier
-    pub candidate_id: String,
-    // Index of the candidate's last log entry
-    pub last_log_index: i32,
-    // Term of the candidate's last log entry
-    pub last_log_term: i32,
-}
-
-/// RequestVoteReply contains the current term for candidate to update, and a bool indication of
-/// received vote
-pub struct RequestVoteReply {
-    // Current term for candidate to update itself
-    pub term: i32,
-    // True means candidate received vote
-    pub vote_granted: bool,
-}
-
-/// AppendEntries call, contains the current term for the candidate and the Id of the leader node
-pub struct AppendEntries {
-    // Current term of the requesting node
-    pub term: i32,
-    // Leader ID
-    pub leader_id: String,
-}
-
-/// AppendEntriesReply call, contains the current term for candidate and a bool indication of
-/// received vote
-pub struct AppendEntriesReply {
-    // Current term for candidate to update itself
-    pub term: i32,
-    // True means candidate received vote
-    pub success: bool,
-}
-
 #[derive(Deserialize, Serialize)]
 pub enum RpcMessage {
     RequestVote(i32, String, i32, i32),
@@ -175,19 +175,26 @@ struct RpcServer {
 
 #[async_trait]
 trait RaftRpc {
-    async fn request_vote(&mut self, r: RequestVote) -> AsyncResult<Vec<RequestVoteReply>>;
+    async fn request_vote(
+        &mut self,
+        r: raft::RequestVote,
+    ) -> AsyncResult<Vec<raft::RequestVoteReply>>;
     async fn append_entries(
         &mut self,
         peer_id: &str,
-        r: AppendEntries,
-    ) -> AsyncResult<AppendEntriesReply>;
-    async fn request_vote_reply(&mut self, peer_id: &str, r: RequestVoteReply) -> AsyncResult<()>;
+        r: raft::AppendEntries,
+    ) -> AsyncResult<raft::AppendEntriesReply>;
+    async fn request_vote_reply(
+        &mut self,
+        peer_id: &str,
+        r: raft::RequestVoteReply,
+    ) -> AsyncResult<()>;
     async fn append_entries_reply(
         &mut self,
         peer_id: &str,
-        r: AppendEntriesReply,
+        r: raft::AppendEntriesReply,
     ) -> AsyncResult<()>;
-    async fn heartbeats(&mut self, r: AppendEntries) -> AsyncResult<(i32, bool)>;
+    async fn heartbeats(&mut self, r: raft::AppendEntries) -> AsyncResult<(i32, bool)>;
 }
 
 pub struct RpcClient {
@@ -227,7 +234,10 @@ impl RpcClient {
 
 #[async_trait]
 impl RaftRpc for RpcClient {
-    async fn request_vote(&mut self, r: RequestVote) -> AsyncResult<Vec<RequestVoteReply>> {
+    async fn request_vote(
+        &mut self,
+        r: raft::RequestVote,
+    ) -> AsyncResult<Vec<raft::RequestVoteReply>> {
         let mut responses: Vec<RpcMessage> = Vec::new();
 
         for stream in self.peers.values_mut() {
@@ -246,7 +256,7 @@ impl RaftRpc for RpcClient {
         let mut response = Vec::new();
         for resp in responses {
             if let RpcMessage::RequestVoteReply(term, vote_granted) = resp {
-                response.push(RequestVoteReply { term, vote_granted });
+                response.push(raft::RequestVoteReply { term, vote_granted });
             }
         }
         Ok(response)
@@ -255,8 +265,8 @@ impl RaftRpc for RpcClient {
     async fn append_entries(
         &mut self,
         peer_id: &str,
-        r: AppendEntries,
-    ) -> AsyncResult<AppendEntriesReply> {
+        r: raft::AppendEntries,
+    ) -> AsyncResult<raft::AppendEntriesReply> {
         let stream = self.peers.get_mut(peer_id).unwrap();
         let append_entries = RpcMessage::AppendEntries(r.term, r.leader_id.clone());
         stream.send(append_entries).await?;
@@ -264,7 +274,7 @@ impl RaftRpc for RpcClient {
             match reply {
                 Ok(re) => {
                     if let RpcMessage::AppendEntriesReply(term, success) = re {
-                        Ok(AppendEntriesReply { term, success })
+                        Ok(raft::AppendEntriesReply { term, success })
                     } else {
                         Err(Box::new(RpcError("append_entries failed".into())))
                     }
@@ -276,7 +286,11 @@ impl RaftRpc for RpcClient {
         }
     }
 
-    async fn request_vote_reply(&mut self, peer_id: &str, r: RequestVoteReply) -> AsyncResult<()> {
+    async fn request_vote_reply(
+        &mut self,
+        peer_id: &str,
+        r: raft::RequestVoteReply,
+    ) -> AsyncResult<()> {
         let stream = self.peers.get_mut(peer_id).unwrap();
         let rvp = RpcMessage::RequestVoteReply(r.term, r.vote_granted);
         stream.send(rvp).await?;
@@ -286,7 +300,7 @@ impl RaftRpc for RpcClient {
     async fn append_entries_reply(
         &mut self,
         peer_id: &str,
-        r: AppendEntriesReply,
+        r: raft::AppendEntriesReply,
     ) -> AsyncResult<()> {
         let stream = self.peers.get_mut(peer_id).unwrap();
         let reply = RpcMessage::AppendEntriesReply(r.term, r.success);
@@ -294,7 +308,7 @@ impl RaftRpc for RpcClient {
         Ok(())
     }
 
-    async fn heartbeats(&mut self, r: AppendEntries) -> AsyncResult<(i32, bool)> {
+    async fn heartbeats(&mut self, r: raft::AppendEntries) -> AsyncResult<(i32, bool)> {
         for stream in self.peers.values_mut() {
             let append_entries = RpcMessage::AppendEntries(r.term, r.leader_id.clone());
             stream.send(append_entries).await?;
@@ -540,7 +554,7 @@ async fn start_election_timer(
         if machine.state != raft::State::Leader {
             continue;
         }
-        let append_entries = AppendEntries {
+        let append_entries = raft::AppendEntries {
             term: machine.current_term,
             leader_id: machine.id.clone(),
         };
@@ -570,7 +584,7 @@ async fn start_election(
         machine.state = raft::State::Candidate;
         machine.current_term += 1;
         machine.voted_for = Some(machine.id.clone());
-        RequestVote {
+        raft::RequestVote {
             term: machine.current_term,
             candidate_id: machine.id.clone(),
             last_log_term: 0,
@@ -599,7 +613,7 @@ async fn start_election(
     Ok(())
 }
 
-fn has_quorum(response: Vec<RequestVoteReply>, peers_number: usize) -> bool {
+fn has_quorum(response: Vec<raft::RequestVoteReply>, peers_number: usize) -> bool {
     let number_of_servers = peers_number + 1; // All peers + current server
     let votes = response.iter().filter(|r| r.vote_granted).count();
     let quorum = (number_of_servers as f64 / 2 as f64).floor();
