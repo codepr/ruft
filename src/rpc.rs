@@ -19,6 +19,7 @@ use tokio_stream::StreamExt;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
 const BACKOFF: u64 = 128;
+const HEARTBEAT_INTERVAL: u64 = 200;
 
 mod raft {
     use log::info;
@@ -117,7 +118,7 @@ mod raft {
                 commit_index: 0,
                 last_applied: 0,
                 state: State::Follower,
-                election_timeout: rand::thread_rng().gen_range(150..500),
+                election_timeout: rand::thread_rng().gen_range(250..500),
                 latest_heartbeat: Instant::now(),
             }
         }
@@ -179,6 +180,8 @@ enum RpcMessage {
     RequestVoteReply(i32, bool),
     AppendEntries(i32, String),
     AppendEntriesReply(i32, bool),
+    ApplyCommand(String),
+    ApplyCommandReply,
 }
 
 struct TokioRpcServer {
@@ -189,30 +192,38 @@ struct TokioRpcServer {
     machine: SharedMachine,
 }
 
+/// A trait defining Raft communication contract between nodes through RPC.
+/// See [raft paper §5](https://raft.github.io/raft.pdf) for details.
 #[async_trait]
 trait RaftRpc {
+    /// Send a RequestVote to each node in the cluster
     async fn request_vote(
         &mut self,
         r: raft::RequestVote,
     ) -> AsyncResult<Vec<raft::RequestVoteReply>>;
+    /// Send an AppendEntries to the target peer in the cluster
     async fn append_entries(
         &mut self,
         peer_id: &str,
         r: raft::AppendEntries,
     ) -> AsyncResult<raft::AppendEntriesReply>;
+    /// Send a RequestVoteReply to the the target peer in the cluster
     async fn request_vote_reply(
         &mut self,
         peer_id: &str,
         r: raft::RequestVoteReply,
     ) -> AsyncResult<()>;
+    /// Send an AppendEntriesReply to the the target peer in the cluster
     async fn append_entries_reply(
         &mut self,
         peer_id: &str,
         r: raft::AppendEntriesReply,
     ) -> AsyncResult<()>;
+    /// Send an empty AppendEntries as heartbeat to each node in the cluster
     async fn heartbeats(&mut self, r: raft::AppendEntries) -> AsyncResult<(i32, bool)>;
 }
 
+/// Tcp client Tokio-based to implement `RaftRpc` interface
 struct TokioRpcClient {
     peers: HashMap<String, Framed<TcpStream, BinCodec<RpcMessage>>>,
 }
@@ -344,6 +355,8 @@ impl RaftRpc for TokioRpcClient {
     }
 }
 
+/// Binary codec based on `bincode` crate, implements `Decoder` and `Encoder` traits of the
+/// `tokio-util` crate, making it suitable to be used as a framed reader-writer
 struct BinCodec<T> {
     phantom_data: PhantomData<T>,
 }
@@ -514,6 +527,10 @@ async fn handle_request(machine: &SharedMachine, msg: RpcMessage) -> Option<RpcM
             }
             Some(RpcMessage::AppendEntriesReply(shared.current_term, success))
         }
+        RpcMessage::ApplyCommand(command) => {
+            info!("{} received ApplyCommand({})", shared.id, command);
+            Some(RpcMessage::ApplyCommandReply)
+        }
         _ => None,
     }
 }
@@ -544,6 +561,10 @@ pub async fn run(id: String, listener: TcpListener, peers: Vec<String>) -> Async
     server.run().await
 }
 
+/// Start the election timer for the current node, it's run concurrently on each server. Every node
+/// is initialized with a random timoeut, the idea is that the first one that timeouts start a new
+/// election on the cluster, broadcasting a `RequestVote` request to each connected node, if quorum
+/// is reached, become the new leader and start sending heartbeats.
 async fn start_election_timer(
     shared: &SharedMachine,
     mut client: impl RaftRpc,
@@ -603,10 +624,12 @@ async fn start_election_timer(
             }
             Err(e) => error!("failed to send heartbeats: {:?}", e),
         };
-        sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(HEARTBEAT_INTERVAL)).await;
     }
 }
 
+/// Broadcasts `RequestVote` to each member of the cluster and based on responses, if quorum is
+/// reached, set the current node as the leader.
 async fn start_election(
     shared: &SharedMachine,
     client: &mut impl RaftRpc,
