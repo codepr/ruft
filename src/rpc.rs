@@ -546,6 +546,9 @@ async fn handle_request(
                 term: shared.current_term,
                 leader_id: shared.id.clone(),
             };
+            // TODO
+            // Propagate command to all peers in the cluster, should try indefinitely if any node
+            // crashes or doesn't respond
             client
                 .lock()
                 .await
