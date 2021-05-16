@@ -190,6 +190,7 @@ struct TokioRpcServer {
     /// Tcp exponential backoff threshold
     backoff: u64,
     machine: SharedMachine,
+    client: Arc<Mutex<dyn RaftRpc + Send>>,
 }
 
 /// A trait defining Raft communication contract between nodes through RPC.
@@ -220,7 +221,10 @@ trait RaftRpc {
         r: raft::AppendEntriesReply,
     ) -> AsyncResult<()>;
     /// Send an empty AppendEntries as heartbeat to each node in the cluster
-    async fn heartbeats(&mut self, r: raft::AppendEntries) -> AsyncResult<(i32, bool)>;
+    async fn broadcast_append_entries(
+        &mut self,
+        r: raft::AppendEntries,
+    ) -> AsyncResult<(i32, bool)>;
 }
 
 /// Tcp client Tokio-based to implement `RaftRpc` interface
@@ -334,7 +338,10 @@ impl RaftRpc for TokioRpcClient {
         Ok(())
     }
 
-    async fn heartbeats(&mut self, r: raft::AppendEntries) -> AsyncResult<(i32, bool)> {
+    async fn broadcast_append_entries(
+        &mut self,
+        r: raft::AppendEntries,
+    ) -> AsyncResult<(i32, bool)> {
         for stream in self.peers.values_mut() {
             let append_entries = RpcMessage::AppendEntries(r.term, r.leader_id.clone());
             stream.send(append_entries).await?;
@@ -435,6 +442,7 @@ impl TokioRpcServer {
             info!("connection from {}", peer.to_string());
             // Create a clone reference of the shared raft state to be used by this connection.
             let machine = self.machine.clone();
+            let client = self.client.clone();
             // Spawn a new task to process the connection, moving the ownership of the cloned
             // db into the async closure.
             tokio::spawn(async move {
@@ -445,7 +453,7 @@ impl TokioRpcServer {
                 while let Some(msg) = frames.next().await {
                     match msg {
                         Ok(m) => {
-                            if let Some(response) = handle_request(&machine, m).await {
+                            if let Some(response) = handle_request(&client, &machine, m).await {
                                 if let Err(e) = frames.send(response).await {
                                     error!("error sending response: {:?}", e);
                                 }
@@ -494,7 +502,11 @@ impl TokioRpcServer {
     }
 }
 
-async fn handle_request(machine: &SharedMachine, msg: RpcMessage) -> Option<RpcMessage> {
+async fn handle_request(
+    client: &Arc<Mutex<impl RaftRpc + ?Sized>>,
+    machine: &SharedMachine,
+    msg: RpcMessage,
+) -> Option<RpcMessage> {
     let mut shared = machine.lock().await;
     match msg {
         RpcMessage::RequestVote(term, id, last_id, last_log) => {
@@ -529,6 +541,17 @@ async fn handle_request(machine: &SharedMachine, msg: RpcMessage) -> Option<RpcM
         }
         RpcMessage::ApplyCommand(command) => {
             info!("{} received ApplyCommand({})", shared.id, command);
+            shared.append_log_entry(command);
+            let append_entries = raft::AppendEntries {
+                term: shared.current_term,
+                leader_id: shared.id.clone(),
+            };
+            client
+                .lock()
+                .await
+                .broadcast_append_entries(append_entries)
+                .await
+                .expect("append_entries to peers");
             Some(RpcMessage::ApplyCommandReply)
         }
         _ => None,
@@ -542,13 +565,14 @@ async fn handle_request(machine: &SharedMachine, msg: RpcMessage) -> Option<RpcM
 /// vector of peers, represented by ip address.
 pub async fn run(id: String, listener: TcpListener, peers: Vec<String>) -> AsyncResult<()> {
     let peers_number = peers.len();
-    let client = TokioRpcClient::new(&peers);
+    let client = Arc::new(Mutex::new(TokioRpcClient::new(&peers)));
     let shared = Arc::new(Mutex::new(raft::Machine::new(id.clone())));
     // Spawn a worker to start a new election timer on the node, responsible for shared state
     // changes and requiring an Rpc client for interactions
     let cloned_machine = shared.clone();
+    let cloned_client = client.clone();
     tokio::spawn(async move {
-        if let Err(e) = start_election_timer(&cloned_machine, client, peers_number).await {
+        if let Err(e) = start_election_timer(&cloned_machine, cloned_client, peers_number).await {
             error!("can't spawn `start_election_timer` worker: {:?}", e);
         }
     });
@@ -557,6 +581,7 @@ pub async fn run(id: String, listener: TcpListener, peers: Vec<String>) -> Async
         listener,
         backoff: BACKOFF,
         machine: shared,
+        client: client.clone(),
     };
     server.run().await
 }
@@ -567,7 +592,7 @@ pub async fn run(id: String, listener: TcpListener, peers: Vec<String>) -> Async
 /// is reached, become the new leader and start sending heartbeats.
 async fn start_election_timer(
     shared: &SharedMachine,
-    mut client: impl RaftRpc,
+    mut client: Arc<Mutex<impl RaftRpc>>,
     peers_number: usize,
 ) -> AsyncResult<()> {
     // Start looping trying a new election if not already a Leader and if the latest AppendEntries
@@ -616,7 +641,12 @@ async fn start_election_timer(
             leader_id: machine.id.clone(),
         };
         info!("{} sending heartbeats", machine.id);
-        match client.heartbeats(append_entries).await {
+        match client
+            .lock()
+            .await
+            .broadcast_append_entries(append_entries)
+            .await
+        {
             Ok((term, resign)) => {
                 if resign {
                     machine.become_follower(term);
@@ -632,7 +662,7 @@ async fn start_election_timer(
 /// reached, set the current node as the leader.
 async fn start_election(
     shared: &SharedMachine,
-    client: &mut impl RaftRpc,
+    client: &mut Arc<Mutex<impl RaftRpc>>,
     peers_number: usize,
 ) -> AsyncResult<bool> {
     let rv = {
@@ -651,7 +681,7 @@ async fn start_election(
             last_log_index: 0,
         }
     };
-    let replies = client.request_vote(rv).await?;
+    let replies = client.lock().await.request_vote(rv).await?;
     // Again we declare a new scope to reduce contention on the shared state
     {
         let mut machine = shared.lock().await;
